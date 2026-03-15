@@ -1,10 +1,10 @@
 # Case 01 — BlackCat (ALPHV) Ransomware: Enterprise Outbreak Investigation
 
-**Case ID:** DFIR-2024-001  
-**Classification:** Critical  
-**Investigator:** Himanshu Chourasia  
-**Tools:** KAPE, Hayabusa, EZTools (MFTECmd, PECmd, RBCmd), CrowdStrike Falcon, Magnet AXIOM  
-**Duration:** 18 hours (initial triage → containment → root cause)
+ Case ID:  DFIR-2024-001  
+ Classification:  Critical  
+ Investigator:  Himanshu Chourasia  
+ Tools:  KAPE, Hayabusa, EZTools (MFTECmd, PECmd, RBCmd), CrowdStrike Falcon, Magnet AXIOM  
+ Duration:  18 hours (initial triage → containment → root cause)
 
 ---
 
@@ -56,7 +56,7 @@ D-0  09:12 UTC  — SOC detects mass file rename alerts in CrowdStrike; IR engag
 
 Upon engagement, KAPE was deployed to the initial beachhead host `JUMP01` and primary domain controller `DC01` for rapid artefact collection.
 
-**KAPE command used:**
+ KAPE command used: 
 
 ```bash
 kape.exe --tsource C: --tdest D:\Cases\DFIR-2024-001\JUMP01 \
@@ -64,14 +64,14 @@ kape.exe --tsource C: --tdest D:\Cases\DFIR-2024-001\JUMP01 \
   --module !EZParser
 ```
 
-**Key artefacts targeted:**
+ Key artefacts targeted: 
 - Windows Event Logs (`Security`, `System`, `PowerShell/Operational`)
 - Scheduled Tasks (`C:\Windows\System32\Tasks\`)
 - Prefetch files (`C:\Windows\Prefetch\`)
 - MFT ($MFT) for timeline reconstruction
 - Registry hives (SYSTEM, SOFTWARE, NTUSER.DAT)
 
-**SHA-256 hashes of acquired images:**
+ SHA-256 hashes of acquired images: 
 ```
 JUMP01_C_Drive.E01   → a3f9d2...c847e1  [VERIFIED]
 DC01_C_Drive.E01     → 7bc401...f93d22  [VERIFIED]
@@ -91,7 +91,7 @@ hayabusa.exe csv-timeline \
   --enable-noisy-rules
 ```
 
-**Critical detections surfaced:**
+ Critical detections surfaced: 
 
 ```
 [CRITICAL] 2024-03-14 09:47:11 UTC | Lsass Memory Dump via Task Manager
@@ -123,7 +123,7 @@ MFTECmd.exe -f "D:\Cases\DFIR-2024-001\JUMP01\$MFT" \
   --csvf JUMP01_MFT.csv
 ```
 
-**Suspicious files identified in MFT:**
+ Suspicious files identified in MFT: 
 
 | Filename | Path | Created (UTC) | Size |
 |----------|------|---------------|------|
@@ -140,7 +140,7 @@ PECmd.exe -d "D:\Cases\DFIR-2024-001\JUMP01\Prefetch" \
   --csv D:\Cases\DFIR-2024-001\prefetch_output\
 ```
 
-**Prefetch confirms execution of:**
+ Prefetch confirms execution of: 
 ```
 RCLONE.EXE-A3B7C291.pf       Last run: 2024-03-14 14:02:17 UTC  (Run count: 4)
 PSEXEC.EXE-D4E812F0.pf        Last run: 2024-03-14 11:05:33 UTC  (Run count: 11)
@@ -153,7 +153,7 @@ SVCHOST_UPDATE.EXE-FF3A1100.pf Last run: 2024-03-15 02:01:58 UTC  (Run count: 1)
 
 CrowdStrike Falcon provided real-time process tree telemetry, corroborating the forensic artefacts.
 
-**Process tree for ransomware execution:**
+ Process tree for ransomware execution: 
 
 ```
 gpscript.exe (GPO execution)
@@ -165,7 +165,7 @@ gpscript.exe (GPO execution)
               └── [File encryption begins across mapped drives]
 ```
 
-**Falcon alert snippets:**
+ Falcon alert snippets: 
 
 ```
 ALERT: Ransomware-like File Modification Activity
@@ -192,7 +192,7 @@ user = logistics_backup_2024@proton.me
 pass = <obfuscated_base64>
 ```
 
-**Network forensics confirmed:**
+ Network forensics confirmed: 
 - 280 GB transferred to MEGA between `2024-03-14 13:55 – 14:22 UTC`
 - Destination IP: `31.216.148.14` (MEGA NZ infrastructure — Netherlands)
 - Exfil rate: ~175 Mbps sustained, suggesting pre-planned staging
@@ -250,6 +250,6 @@ HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\
 
 ## Lessons Learned
 
-- **Detection gap:** LSASS dump via Task Manager triggered a low-severity alert that was not actioned. A dedicated playbook for credential dumping detections — regardless of severity — would have shortened dwell time from 72 hours to under 4 hours.
-- **Exfiltration detection:** 280 GB leaving the network in 27 minutes should have triggered a DLP alert. Network egress baselining and anomaly alerting was absent.
-- **Immutable backups were the deciding factor:** Recovery was possible within 48 hours due to an offline, air-gapped backup taken 7 days prior. Without it, estimated recovery time was 3–4 weeks.
+-  Detection gap:  LSASS dump via Task Manager triggered a low-severity alert that was not actioned. A dedicated playbook for credential dumping detections — regardless of severity — would have shortened dwell time from 72 hours to under 4 hours.
+-  Exfiltration detection:  280 GB leaving the network in 27 minutes should have triggered a DLP alert. Network egress baselining and anomaly alerting was absent.
+-  Immutable backups were the deciding factor:  Recovery was possible within 48 hours due to an offline, air-gapped backup taken 7 days prior. Without it, estimated recovery time was 3–4 weeks.
