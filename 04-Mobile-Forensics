@@ -1,0 +1,258 @@
+# Case 04 — Insider Data Exfiltration via Android Device: Mobile Forensics Investigation
+
+**Case ID:** DFIR-2024-004  
+**Classification:** High — Insider Threat  
+**Investigator:** Himanshu Chourasia  
+**Tools:** Cellebrite UFED 4PC, MSAB XRY, Magnet AXIOM  
+**Duration:** 14 hours (device acquisition → full analysis → legal reporting)
+
+---
+
+## Executive Summary
+
+A pharmaceutical company's HR department raised a concern about a Senior R&D Engineer (`P. Verma`) who had submitted resignation with a 30-day notice and was suspected of exfiltrating proprietary drug formulation data. A forensic examination of the employee's company-issued Android device (Samsung Galaxy S23) and personal device (voluntarily surrendered) revealed a systematic pattern of data exfiltration spanning 6 weeks — including transfer of 14.3 GB of confidential research data to a personal Google Drive account and encrypted messaging with a competitor's recruiter.
+
+All forensic procedures were conducted under a court-issued preservation order. Full chain of custody was maintained.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Collection | Data from Local System | T1005 | Files copied from corporate OneDrive to local storage |
+| Collection | Data Staged | T1074.001 | ZIP archives of R&D files found in /DCIM/Camera/.tmp/ |
+| Exfiltration | Exfiltration to Cloud Storage | T1567.002 | 14.3 GB to personal Google Drive |
+| Exfiltration | Exfiltration via Physical Medium | T1052 | Transfer via USB OTG to personal device confirmed |
+| Defense Evasion | Hide Artifacts | T1564 | Files staged in camera folder to evade MDM DLP |
+| Impact | Data Theft | T1657 | Proprietary drug formulation documents identified |
+
+---
+
+## Evidence Inventory
+
+| Item | Description | Hash (SHA-256) | Condition |
+|------|-------------|----------------|-----------|
+| E01 | Samsung Galaxy S23 (company-issued) | a3f9d2...c847e1 | Intact |
+| E02 | Samsung Galaxy A54 (personal device) | 7bc401...f93d22 | Intact |
+| E03 | 128GB Samsung USB drive | d4e8f2...a91c33 | Intact |
+
+All devices were powered off at collection, placed in Faraday bags immediately to prevent remote wipe, and transported under chain of custody.
+
+---
+
+## Investigation Walkthrough
+
+### Phase 1 — Acquisition: Cellebrite UFED 4PC
+
+#### Company Device (E01 — Samsung Galaxy S23)
+
+```
+Extraction Type:    Full File System (root via Cellebrite Premium exploit)
+Android Version:    14
+UFED Version:       7.68.0.352
+Extraction Start:   2024-04-02 09:14:22 UTC
+Extraction End:     2024-04-02 11:03:47 UTC
+Image Size:         128 GB
+SHA-256:            a3f9d2...c847e1  [VERIFIED PRE AND POST]
+```
+
+> Full File System extraction was possible due to Cellebrite Premium supporting the Samsung S23 chipset (Exynos 2200). This provided access to decrypted application data, deleted file space, and SQLite databases not accessible via standard logical extraction.
+
+#### Personal Device (E02 — Samsung Galaxy A54)
+
+```
+Extraction Type:    Advanced Logical (device locked — PIN unknown)
+Android Version:    13
+Extraction via:     MSAB XRY — Pincode bypass (A54 supported)
+Image Size:         64 GB
+SHA-256:            7bc401...f93d22  [VERIFIED]
+```
+
+---
+
+### Phase 2 — Analysis: Magnet AXIOM
+
+Both extractions were loaded into Magnet AXIOM for unified timeline analysis.
+
+#### File System Analysis — Company Device
+
+**Suspicious directory identified:**
+
+```
+Path: /sdcard/DCIM/Camera/.tmp/
+Contents:
+  - RD_FormulationData_Q4_FINAL.zip     (4.2 GB)  Created: 2024-03-15 22:41:03
+  - Clinical_Trials_Phase3_RESTRICTED.zip (3.8 GB)  Created: 2024-03-22 19:15:44
+  - Synthesis_Procedures_CONFIDENTIAL.zip (6.3 GB)  Created: 2024-03-29 21:00:17
+```
+
+> Hiding ZIP archives inside the `/DCIM/Camera/.tmp/` directory is a deliberate evasion technique — most MDM DLP solutions scan known paths (Documents, Downloads) but not hidden subdirectories within Camera folders.
+
+**File metadata analysis:**
+
+```bash
+# Extracted via AXIOM artifact → File System → Metadata
+Filename: RD_FormulationData_Q4_FINAL.zip
+Created:   2024-03-15 22:41:03 UTC
+Modified:  2024-03-15 22:41:03 UTC
+Accessed:  2024-03-30 23:12:01 UTC  ← accessed night before resignation submitted
+MD5:       d41d8cd98f00b204e9800998ecf8427e
+Containing: 847 files (.pdf, .docx, .xlsx) — all bearing company watermark
+```
+
+---
+
+#### Google Drive Upload Evidence
+
+Magnet AXIOM recovered Google Drive sync logs from the app's SQLite database:
+
+```
+Path: /data/data/com.google.android.apps.docs/databases/snapshot.db
+```
+
+**AXIOM parsed output:**
+
+```
+Upload Events (Account: prateek.verma.personal@gmail.com):
+
+2024-03-16 00:02:11  RD_FormulationData_Q4_FINAL.zip       4.2 GB  UPLOAD_COMPLETE
+2024-03-23 00:14:43  Clinical_Trials_Phase3_RESTRICTED.zip  3.8 GB  UPLOAD_COMPLETE
+2024-03-30 23:55:01  Synthesis_Procedures_CONFIDENTIAL.zip  6.3 GB  UPLOAD_COMPLETE
+Total Exfiltrated: 14.3 GB across 3 sessions
+```
+
+> All uploads occurred between 23:55 and 00:15 — outside business hours, suggesting deliberate timing to avoid detection.
+
+---
+
+#### USB OTG Transfer Evidence
+
+Media transfer logs recovered from `Media Storage` application database:
+
+```
+Path: /data/data/com.android.providers.media/databases/external.db
+
+Table: files
+_id   _data                                          date_added            size
+---   -----------------------------------------------  --------------------  -------
+1847  /sdcard/DCIM/Camera/.tmp/RD_Formulation[...].zip  2024-03-16 22:19:03  4.2 GB
+```
+
+MTP transfer logs confirmed transfer to external device:
+
+```
+Device Connected (USB OTG):    2024-03-16 22:18:44 UTC
+Device:                        Samsung USB Drive (SN: ABCD1234EFGH)  ← matches E03
+Transfer Initiated:            2024-03-16 22:19:03 UTC
+Transfer Completed:            2024-03-16 22:31:47 UTC  (12 min 44 sec)
+Files Transferred:             RD_FormulationData_Q4_FINAL.zip
+```
+
+---
+
+#### Telegram — Encrypted Communications with Competitor
+
+Telegram's local database was decrypted and parsed by AXIOM:
+
+```
+Path: /data/data/org.telegram.messenger/files/cache4.db
+```
+
+**Relevant message thread (Contact: "Rahul_NovaPharma"):**
+
+```
+[2024-02-28 18:42:11] Rahul_NovaPharma: "Can you get us the Phase 3 data? 
+                       Very interested in the synthesis procedures."
+
+[2024-02-28 19:15:03] P. Verma: "I can get everything. Need confirmation 
+                       of the package first."
+
+[2024-03-01 09:00:44] Rahul_NovaPharma: "Package confirmed. 50L + ESOP 
+                       equivalent. Joining bonus of 10L."
+
+[2024-03-01 09:45:12] P. Verma: "Understood. Will take time. 
+                       I'll resign after I have everything secured."
+
+[2024-03-30 23:58:01] P. Verma: "Last batch uploaded. Everything is there.
+                       Submitting resignation tomorrow."
+
+[2024-03-31 08:00:00] P. Verma: "Resignation submitted."
+```
+
+> This message thread establishes premeditation and a direct financial motive. The timeline precisely maps to the exfiltration events identified in the Google Drive logs.
+
+---
+
+#### Personal Device (E02) — Corroboration
+
+MSAB XRY analysis of personal device confirmed:
+
+```
+Google Drive App (account: prateek.verma.personal@gmail.com):
+  - Storage Used: 16.1 GB (account previously at ~600 MB)
+  - Recent Files: RD_FormulationData_Q4_FINAL.zip (last accessed: 2024-04-01)
+
+File Manager:
+  - USB OTG import detected: 3 ZIP files imported from external drive E03
+  - Import timestamps match transfer events on E01
+
+Telegram:
+  - Same conversation thread corroborated
+  - Contact "Rahul_NovaPharma" — phone number: +91-98XXXXXXXX
+    (number confirmed as registered to a NovaPharma employee via HR cross-check)
+```
+
+---
+
+### Phase 3 — Timeline Reconstruction (Unified)
+
+```
+2024-02-28  — Initial contact from NovaPharma recruiter via Telegram
+2024-03-01  — Employment package confirmed; exfiltration plan agreed
+2024-03-15  — First ZIP archive created on company device
+2024-03-16  — Uploaded to personal Google Drive (00:02 UTC); copied to USB drive (22:19 UTC)
+2024-03-22  — Second ZIP archive created
+2024-03-23  — Uploaded to personal Google Drive (00:14 UTC)
+2024-03-29  — Third ZIP archive created
+2024-03-30  — Uploaded to personal Google Drive (23:55 UTC)
+2024-03-31  — Resignation submitted
+2024-04-01  — HR notified security team
+2024-04-02  — Devices seized under preservation order; forensic acquisition initiated
+```
+
+---
+
+## Forensic Findings Summary
+
+| Finding | Evidence Source | Significance |
+|---------|----------------|--------------|
+| 14.3 GB of R&D data exfiltrated | Google Drive sync DB | Core exfiltration evidence |
+| Files hidden in .tmp camera folder | File system analysis | Deliberate MDM evasion |
+| USB OTG transfer to personal device | MTP transfer logs | Secondary exfiltration path |
+| Telegram communications with competitor | Telegram DB (decrypted) | Establishes premeditation & motive |
+| Personal device corroborates all events | XRY analysis | Independent corroboration |
+| Timing: all uploads between 23:55–00:15 | Upload timestamps | Deliberate after-hours evasion |
+
+---
+
+## Legal Reporting Notes
+
+All findings were documented in a forensically sound report prepared for civil litigation and potential criminal referral under the **Information Technology Act, 2000 (Section 43 & 66)** and **Indian Penal Code Section 378 (theft of data)**.
+
+- Chain of custody documentation completed for all 3 exhibits
+- Hashes verified at acquisition, during analysis, and at report completion
+- Expert witness statement prepared for civil court proceedings
+- Google Drive preservation request submitted to Google India legal team
+
+---
+
+## Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| DLP bypassed via hidden folder | Extend MDM DLP scanning to all directories including hidden paths |
+| No alert on 4+ GB upload | Implement cloud upload size alerts (threshold: >500 MB in single session) |
+| USB OTG unrestricted | Enforce MDM policy: disable USB OTG on all company devices |
+| After-hours exfiltration undetected | Enable off-hours data access alerting via CASB |
+| No pre-departure access review | Implement automatic access reduction 30 days before known departure |
