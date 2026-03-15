@@ -1,10 +1,10 @@
 # Case 04 — Insider Data Exfiltration via Android Device: Mobile Forensics Investigation
 
-**Case ID:** DFIR-2024-004  
-**Classification:** High — Insider Threat  
-**Investigator:** Himanshu Chourasia  
-**Tools:** Cellebrite UFED 4PC, MSAB XRY, Magnet AXIOM  
-**Duration:** 14 hours (device acquisition → full analysis → legal reporting)
+Case ID: DFIR-2024-004  
+Classification: High — Insider Threat  
+Investigator: Himanshu Chourasia  
+Tools: Cellebrite UFED 4PC, MSAB XRY, Magnet AXIOM  
+Duration: 14 hours (device acquisition → full analysis → legal reporting)
 
 ---
 
@@ -77,7 +77,7 @@ Both extractions were loaded into Magnet AXIOM for unified timeline analysis.
 
 #### File System Analysis — Company Device
 
-**Suspicious directory identified:**
+Suspicious directory identified:
 
 ```
 Path: /sdcard/DCIM/Camera/.tmp/
@@ -89,7 +89,7 @@ Contents:
 
 > Hiding ZIP archives inside the `/DCIM/Camera/.tmp/` directory is a deliberate evasion technique — most MDM DLP solutions scan known paths (Documents, Downloads) but not hidden subdirectories within Camera folders.
 
-**File metadata analysis:**
+File metadata analysis:
 
 ```bash
 # Extracted via AXIOM artifact → File System → Metadata
@@ -111,7 +111,7 @@ Magnet AXIOM recovered Google Drive sync logs from the app's SQLite database:
 Path: /data/data/com.google.android.apps.docs/databases/snapshot.db
 ```
 
-**AXIOM parsed output:**
+AXIOM parsed output:
 
 ```
 Upload Events (Account: prateek.verma.personal@gmail.com):
@@ -159,7 +159,7 @@ Telegram's local database was decrypted and parsed by AXIOM:
 Path: /data/data/org.telegram.messenger/files/cache4.db
 ```
 
-**Relevant message thread (Contact: "Rahul_NovaPharma"):**
+Relevant message thread (Contact: "Rahul_NovaPharma"):
 
 ```
 [2024-02-28 18:42:11] Rahul_NovaPharma: "Can you get us the Phase 3 data? 
@@ -238,7 +238,7 @@ Telegram:
 
 ## Legal Reporting Notes
 
-All findings were documented in a forensically sound report prepared for civil litigation and potential criminal referral under the **Information Technology Act, 2000 (Section 43 & 66)** and **Indian Penal Code Section 378 (theft of data)**.
+All findings were documented in a forensically sound report prepared for civil litigation and potential criminal referral under the Information Technology Act, 2000 (Section 43 & 66) and Indian Penal Code Section 378 (theft of data).
 
 - Chain of custody documentation completed for all 3 exhibits
 - Hashes verified at acquisition, during analysis, and at report completion
