@@ -1,0 +1,295 @@
+# Case 03 — BEC & Credential Harvesting: Splunk Log Investigation
+
+**Case ID:** DFIR-2024-003  
+**Classification:** High  
+**Investigator:** Himanshu Chourasia  
+**Tools:** Splunk SPL, Chainsaw, Sigma Rules, Hayabusa, Magnet AXIOM  
+**Duration:** 6 hours (detection → full scope → containment)
+
+---
+
+## Executive Summary
+
+A Business Email Compromise (BEC) attack targeting a manufacturing company's CFO resulted in an attempted fraudulent wire transfer of €420,000. The threat actor phished a Finance Manager, harvested Office 365 credentials via an adversary-in-the-middle (AiTM) proxy, bypassed MFA, and used inbox rules to hide correspondence from the victim. Splunk log analysis across Azure AD, O365 audit logs, and endpoint telemetry revealed the full attack chain within 6 hours — in time to freeze the outgoing transfer.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Initial Access | Phishing: Spearphishing Link | T1566.002 | AiTM phishing link via email |
+| Credential Access | Adversary-in-the-Middle | T1557 | Evilginx2 proxy — session cookie harvested |
+| Defense Evasion | Email Hiding Rules | T1564.008 | Inbox rule forwarding finance emails to Deleted |
+| Collection | Email Collection | T1114.002 | Mailbox accessed from anomalous IP |
+| Exfiltration | Exfiltration to Cloud | T1567 | Bulk email download via OWA |
+| Impact | Financial Theft | T1657 | Fraudulent wire transfer instruction email sent |
+
+---
+
+## Timeline of Compromise
+
+```
+D-2  11:04 UTC  — Phishing email sent to rmehra@company.com: "Invoice_Approval_Required.html"
+D-2  11:31 UTC  — rmehra clicked AiTM link; credentials + session cookie harvested
+D-2  11:33 UTC  — Threat actor authenticated to O365 from 185.220.101.12 (Netherlands VPN)
+D-2  11:34 UTC  — Inbox rule created: move emails containing "invoice","payment","wire" to Deleted
+D-2  11:35 UTC  — Bulk mailbox access: 1,247 emails downloaded via OWA
+D-2  11:50 UTC  — Email sent to CFO impersonating rmehra requesting €420K transfer
+D-1  09:00 UTC  — CFO approved transfer; finance team queued payment
+D-0  08:14 UTC  — Splunk alert fires: impossible travel — rmehra login from IN + NL within 4 min
+D-0  08:22 UTC  — IR engaged; wire transfer frozen 40 minutes before execution
+```
+
+---
+
+## Investigation Walkthrough
+
+### Phase 1 — Splunk: Initial Detection & Scoping
+
+#### Impossible Travel Detection
+
+The initial alert was triggered by a custom Splunk correlation search detecting logins from geographically impossible locations within a short time window.
+
+```spl
+index=azure_ad sourcetype=azure:aad:signin
+| eval login_time=strptime(CreatedDateTime, "%Y-%m-%dT%H:%M:%SZ")
+| sort user, login_time
+| streamstats current=f last(login_time) as prev_time last(IPAddress) as prev_ip by user
+| eval time_diff_mins=round((login_time - prev_time)/60, 2)
+| iplocation IPAddress
+| iplocation prefix=prev_ prev_ip
+| eval speed_kmh=if(isnotnull(lat) AND isnotnull(prev_lat),
+    round(geodistance(lat, lon, prev_lat, prev_lon) / (time_diff_mins/60), 0), null())
+| where speed_kmh > 900 AND time_diff_mins < 30
+| table user, IPAddress, Country, prev_ip, prev_Country, time_diff_mins, speed_kmh
+```
+
+**Output:**
+```
+user         IPAddress        Country      prev_ip         prev_Country  time_diff  speed_kmh
+-----------  ---------------  -----------  --------------  ------------  ---------  ---------
+rmehra       185.220.101.12   Netherlands  49.36.201.44    India         3.8 min    14,271
+```
+
+---
+
+#### Scoping: All Activity from Threat Actor IP
+
+```spl
+index=o365_audit OR index=azure_ad
+| search IPAddress="185.220.101.12"
+| eval time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| table time, user, Operation, IPAddress, ResultStatus, ClientInfoString
+| sort time
+```
+
+**Results:**
+```
+2024-03-13 11:33:01  rmehra  UserLoggedIn          185.220.101.12  Success  OWA
+2024-03-13 11:34:07  rmehra  New-InboxRule          185.220.101.12  Success  OWA
+2024-03-13 11:35:12  rmehra  MailItemsAccessed      185.220.101.12  Success  OWA
+2024-03-13 11:50:44  rmehra  SendMail               185.220.101.12  Success  OWA
+```
+
+---
+
+### Phase 2 — Inbox Rule Forensics
+
+#### Enumerating Malicious Inbox Rules
+
+```spl
+index=o365_audit Operation="New-InboxRule" OR Operation="Set-InboxRule"
+| spath input=Parameters
+| eval rule_name=mvindex(Parameters{}.Value, 0)
+| eval conditions=mvindex(Parameters{}.Value, 1)
+| table _time, user, IPAddress, Operation, rule_name, conditions
+```
+
+**Malicious rule detected:**
+```
+Time:       2024-03-13 11:34:07 UTC
+User:       rmehra
+Operation:  New-InboxRule
+Rule Name:  "AutoArchive_FIN"
+Conditions: SubjectContainsWords: [invoice, payment, wire, transfer, urgent, approval]
+Actions:    MoveToFolder: Deleted Items, MarkAsRead: True
+```
+
+> The inbox rule silently moved and marked-as-read all finance-related emails — preventing the victim from seeing the fraudulent correspondence being sent in their name.
+
+---
+
+#### Bulk Mail Access Investigation
+
+```spl
+index=o365_audit Operation="MailItemsAccessed" user="rmehra"
+| eval time=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| stats count as emails_accessed, values(ClientInfoString) as clients,
+        values(IPAddress) as source_ips by time, user
+| where emails_accessed > 50
+```
+
+```
+Time                  User    Emails Accessed  Client   Source IP
+--------------------  ------  ---------------  -------  ----------------
+2024-03-13 11:35:12   rmehra  1,247            OWA      185.220.101.12
+```
+
+---
+
+### Phase 3 — Reconstructing the BEC Email
+
+```spl
+index=o365_audit Operation="SendMail" user="rmehra"
+| spath input=ModifiedProperties
+| eval recipients=mvindex(ModifiedProperties{}.NewValue, 0)
+| eval subject=mvindex(ModifiedProperties{}.NewValue, 1)
+| table _time, user, recipients, subject, IPAddress
+```
+
+**Fraudulent email:**
+```
+From:     rmehra@company.com (session hijacked)
+To:       cfo@company.com
+Subject:  URGENT: Wire Transfer Approval Required — Vendor Settlement
+Time:     2024-03-13 11:50:44 UTC
+Source:   185.220.101.12 (Netherlands VPN)
+Body:     [Requesting €420,000 transfer to IBAN: NL91ABNA0417164300]
+```
+
+---
+
+### Phase 4 — Chainsaw: Windows Event Log Corroboration
+
+Chainsaw was run against the endpoint logs from `rmehra`'s workstation to confirm no persistence was established locally.
+
+```bash
+chainsaw hunt D:\Cases\DFIR-2024-003\EventLogs\ \
+  --sigma sigma_rules/ \
+  --mapping mappings/sigma-event-logs-all.yml \
+  --output chainsaw_results.csv \
+  --level medium
+```
+
+**Key findings from Chainsaw:**
+```
+[HIGH]   Suspicious PowerShell Download Cradle               — NOT FOUND
+[HIGH]   Scheduled Task Creation via Schtasks                — NOT FOUND  
+[MEDIUM] O365 Login from New Country                         — FOUND (Netherlands)
+[MEDIUM] Multiple Failed MFA Attempts Before Success         — FOUND (3 failures, 1 success)
+[LOW]    OWA Access Outside Business Hours                   — NOT APPLICABLE (11:33 UTC = business hours)
+```
+
+> The 3 failed MFA attempts before success is consistent with AiTM attack behaviour — the proxy relays credentials and session tokens in real time, sometimes requiring a few attempts as the victim completes MFA.
+
+---
+
+### Phase 5 — AiTM Phishing Infrastructure Analysis
+
+The phishing link from the original email was analysed in a sandboxed environment:
+
+**Phishing URL:** `https://login.company-invoiceportal[.]com/auth`
+
+**WHOIS:**
+```
+Domain:     company-invoiceportal.com
+Registered: 2024-03-10  (3 days before the attack)
+Registrar:  Namecheap
+NS:         cloudflare  (fronted)
+```
+
+**SSL Certificate:**
+```
+Issued to:  login.company-invoiceportal.com
+Issuer:     Let's Encrypt  (free cert — consistent with phishing infra)
+Valid from: 2024-03-10
+```
+
+**HTTP Response Analysis:**
+```
+Server: nginx/1.18.0
+X-Powered-By: [redacted]
+Set-Cookie: phishsession=...; Secure; HttpOnly
+→ Page: pixel-perfect clone of Microsoft O365 login page
+→ Real-time credential relay confirmed via timing analysis
+```
+
+---
+
+## Splunk Detection Dashboards Built During Investigation
+
+### Dashboard 1: BEC Hunting Panel (SPL)
+
+```spl
+| multisearch
+  [search index=o365_audit Operation="New-InboxRule" | eval type="Inbox Rule Created"]
+  [search index=o365_audit Operation="MailItemsAccessed"
+    | stats count by user | where count > 200 | eval type="Bulk Mail Access"]
+  [search index=azure_ad ResultStatus="Success"
+    | iplocation IPAddress | where Country!="India" | eval type="Foreign Login"]
+| table _time, user, type, IPAddress, Country
+| sort -_time
+```
+
+### Dashboard 2: Active Session Anomaly
+
+```spl
+index=azure_ad sourcetype=azure:aad:signin ResultStatus="Success"
+| iplocation IPAddress
+| eval risk_score=case(
+    Country!="India", 50,
+    ClientAppUsed="Browser" AND UserAgent LIKE "%HeadlessChrome%", 80,
+    isnotnull(DeviceDetail.isCompliant) AND DeviceDetail.isCompliant="false", 40,
+    true(), 0)
+| where risk_score > 40
+| table _time, user, IPAddress, Country, ClientAppUsed, risk_score
+| sort -risk_score
+```
+
+---
+
+## Indicators of Compromise
+
+### Network
+```
+185.220.101.12          — Threat actor IP (NordVPN Netherlands exit node)
+login.company-invoiceportal[.]com  — AiTM phishing domain
+```
+
+### Email
+```
+To:      cfo@company.com
+Subject: URGENT: Wire Transfer Approval Required — Vendor Settlement
+IBAN:    NL91ABNA0417164300  (fraudulent beneficiary)
+```
+
+### O365 Behavioural
+```
+Inbox rule: "AutoArchive_FIN" — move finance keywords to Deleted Items
+Bulk OWA access: 1,247 items in 4 minutes
+SendMail from foreign IP during active user session
+```
+
+---
+
+## Containment Actions
+
+1. Revoked all active O365 sessions for `rmehra` via Azure AD
+2. Blocked `185.220.101.12` and `company-invoiceportal.com` at proxy and email gateway
+3. Deleted malicious inbox rule `AutoArchive_FIN`
+4. Contacted bank — wire transfer frozen 40 minutes before execution
+5. Notified CERT-In (mandatory reporting — financial sector)
+6. Enforced FIDO2 hardware key MFA for all Finance and Executive accounts
+
+---
+
+## Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| AiTM bypassed SMS MFA | Enforce FIDO2/hardware token MFA for privileged and finance users |
+| Inbox rule not alerted | Build Splunk alert: inbox rules created from foreign IPs |
+| 11-day invoice window exploited | Implement dual-approval for all wire transfers above €10,000 |
+| No mail flow anomaly detection | Deploy Microsoft Defender for Office 365 — BEC detection policy |
+| Phishing domain not blocked | Subscribe to threat intel feed; auto-block newly registered lookalike domains |
