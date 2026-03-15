@@ -1,14 +1,17 @@
 # DFIR Investigation Case Files
 
-**Author:** Himanshu Chourasia — Senior DFIR Engineer  
-**LinkedIn:** [linkedin.com/in/chourasia04](https://www.linkedin.com/in/chourasia04/)  
+**Author:** Himanshu Chourasia — Senior DFIR Engineer
+**LinkedIn:** [linkedin.com/in/chourasia04](https://www.linkedin.com/in/chourasia04/)
 **Experience:** 3+ years | Federal Law Enforcement (CBI) + Enterprise IR (Hitachi Systems)
 
 ---
 
 ## About This Repository
 
-This repository contains senior-level Digital Forensics & Incident Response (DFIR) investigation writeups. Each case is a realistic scenario modelled on common enterprise and law enforcement threat patterns, documented to the standard of legally defensible forensic reporting.
+This repository contains senior-level Digital Forensics & Incident Response (DFIR)
+investigation writeups. Each case is a realistic scenario modelled on common enterprise
+and law enforcement threat patterns, documented to the standard of legally defensible
+forensic reporting.
 
 All investigations include:
 - Full attacker timeline reconstruction
@@ -49,7 +52,6 @@ All investigations include:
 ## Methodology
 
 All investigations follow the **NIST SP 800-61r2** Incident Response lifecycle:
-
 ```
 Preparation → Detection & Analysis → Containment → Eradication → Recovery → Post-Incident
 ```
@@ -63,7 +65,6 @@ Forensic integrity is maintained throughout via:
 ---
 
 ## MITRE ATT&CK Coverage
-
 ```
 Initial Access        ████████████  TA0001
 Execution             ████████████  TA0002
@@ -81,4 +82,6 @@ Impact                ████████████  TA0040
 
 ---
 
-> **Disclaimer:** All scenarios, hostnames, IP addresses, usernames, and company names used in these writeups are for educational and portfolio purposes only. No real case data, evidence, or sensitive information is disclosed.
+> **Disclaimer:** All scenarios, hostnames, IP addresses, usernames, and company names
+> used in these writeups are created for educational and portfolio
+> purposes only. No real case data, evidence, or sensitive information is disclosed.
