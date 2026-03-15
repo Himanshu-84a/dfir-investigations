@@ -1,10 +1,10 @@
 # Case 03 — BEC & Credential Harvesting: Splunk Log Investigation
 
-**Case ID:** DFIR-2024-003  
-**Classification:** High  
-**Investigator:** Himanshu Chourasia  
-**Tools:** Splunk SPL, Chainsaw, Sigma Rules, Hayabusa, Magnet AXIOM  
-**Duration:** 6 hours (detection → full scope → containment)
+Case ID: DFIR-2024-003  
+Classification: High  
+Investigator: Himanshu Chourasia  
+Tools: Splunk SPL, Chainsaw, Sigma Rules, Hayabusa, Magnet AXIOM  
+Duration: 6 hours (detection → full scope → containment)
 
 ---
 
@@ -65,7 +65,7 @@ index=azure_ad sourcetype=azure:aad:signin
 | table user, IPAddress, Country, prev_ip, prev_Country, time_diff_mins, speed_kmh
 ```
 
-**Output:**
+Output:
 ```
 user         IPAddress        Country      prev_ip         prev_Country  time_diff  speed_kmh
 -----------  ---------------  -----------  --------------  ------------  ---------  ---------
@@ -84,7 +84,7 @@ index=o365_audit OR index=azure_ad
 | sort time
 ```
 
-**Results:**
+Results:
 ```
 2024-03-13 11:33:01  rmehra  UserLoggedIn          185.220.101.12  Success  OWA
 2024-03-13 11:34:07  rmehra  New-InboxRule          185.220.101.12  Success  OWA
@@ -106,7 +106,7 @@ index=o365_audit Operation="New-InboxRule" OR Operation="Set-InboxRule"
 | table _time, user, IPAddress, Operation, rule_name, conditions
 ```
 
-**Malicious rule detected:**
+Malicious rule detected:
 ```
 Time:       2024-03-13 11:34:07 UTC
 User:       rmehra
@@ -148,7 +148,7 @@ index=o365_audit Operation="SendMail" user="rmehra"
 | table _time, user, recipients, subject, IPAddress
 ```
 
-**Fraudulent email:**
+Fraudulent email:
 ```
 From:     rmehra@company.com (session hijacked)
 To:       cfo@company.com
@@ -172,7 +172,7 @@ chainsaw hunt D:\Cases\DFIR-2024-003\EventLogs\ \
   --level medium
 ```
 
-**Key findings from Chainsaw:**
+Key findings from Chainsaw:
 ```
 [HIGH]   Suspicious PowerShell Download Cradle               — NOT FOUND
 [HIGH]   Scheduled Task Creation via Schtasks                — NOT FOUND  
@@ -189,9 +189,9 @@ chainsaw hunt D:\Cases\DFIR-2024-003\EventLogs\ \
 
 The phishing link from the original email was analysed in a sandboxed environment:
 
-**Phishing URL:** `https://login.company-invoiceportal[.]com/auth`
+Phishing URL: `https://login.company-invoiceportal[.]com/auth`
 
-**WHOIS:**
+WHOIS:
 ```
 Domain:     company-invoiceportal.com
 Registered: 2024-03-10  (3 days before the attack)
@@ -199,14 +199,14 @@ Registrar:  Namecheap
 NS:         cloudflare  (fronted)
 ```
 
-**SSL Certificate:**
+SSL Certificate:
 ```
 Issued to:  login.company-invoiceportal.com
 Issuer:     Let's Encrypt  (free cert — consistent with phishing infra)
 Valid from: 2024-03-10
 ```
 
-**HTTP Response Analysis:**
+HTTP Response Analysis:
 ```
 Server: nginx/1.18.0
 X-Powered-By: [redacted]
