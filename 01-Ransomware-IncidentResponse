@@ -1,0 +1,255 @@
+# Case 01 — BlackCat (ALPHV) Ransomware: Enterprise Outbreak Investigation
+
+**Case ID:** DFIR-2024-001  
+**Classification:** Critical  
+**Investigator:** Himanshu Chourasia  
+**Tools:** KAPE, Hayabusa, EZTools (MFTECmd, PECmd, RBCmd), CrowdStrike Falcon, Magnet AXIOM  
+**Duration:** 18 hours (initial triage → containment → root cause)
+
+---
+
+## Executive Summary
+
+A mid-sized logistics firm (2,400 endpoints) suffered a BlackCat/ALPHV ransomware outbreak that encrypted 340 servers across three data centres over a 6-hour window. The threat actor gained initial access via a VPN appliance vulnerability (CVE-2023-46805 — Ivanti Connect Secure), established persistence using a scheduled task masquerading as a Windows update process, and conducted lateral movement via PsExec and stolen domain admin credentials before deploying the ransomware encryptor via GPO.
+
+This report details the full attacker timeline, forensic artefacts recovered, TTPs mapped to MITRE ATT&CK, and recommendations to prevent recurrence.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Initial Access | Exploit Public-Facing Application | T1190 | Ivanti VPN exploit — CVE-2023-46805 |
+| Execution | Scheduled Task/Job | T1053.005 | `WindowsUpdateSvc` scheduled task |
+| Persistence | Create Account | T1136.002 | Domain account `svc_backup2` created |
+| Defense Evasion | Masquerading | T1036.005 | Encryptor named `svchost_update.exe` |
+| Credential Access | OS Credential Dumping | T1003.001 | LSASS memory dump via Task Manager |
+| Lateral Movement | Remote Services: SMB/Windows Admin Shares | T1021.002 | PsExec across C$ shares |
+| Collection | Data from Local System | T1005 | Staging in `C:\ProgramData\temp\` |
+| Exfiltration | Exfiltration Over Web Service | T1567.002 | Rclone → MEGA cloud |
+| Impact | Data Encrypted for Impact | T1486 | .bcrypt extension, ransom note dropped |
+
+---
+
+## Timeline of Compromise
+
+```
+D-3  10:14 UTC  — Initial exploit of Ivanti VPN (CVE-2023-46805) from IP 185.220.101.47
+D-3  10:22 UTC  — Web shell dropped: /dana-na/auth/saml-sso/webshell.cgi
+D-3  11:45 UTC  — Legitimate admin credentials harvested from VPN session token
+D-3  14:30 UTC  — First RDP login to JUMP01 using stolen creds (user: jmartin)
+D-2  09:00 UTC  — LSASS dump via Task Manager on DC01 (detected, not alerted)
+D-2  09:47 UTC  — Domain account svc_backup2 created (T1136.002)
+D-2  11:00 UTC  — PsExec lateral movement to 12 servers across VLAN 10 and VLAN 20
+D-2  14:00 UTC  — Rclone installed; 280GB staged data exfiltrated to MEGA (T1567.002)
+D-1  02:00 UTC  — GPO deployed: svchost_update.exe pushed to all domain-joined machines
+D-0  03:47 UTC  — Encryption begins; 340 servers encrypted within 6 hours
+D-0  09:12 UTC  — SOC detects mass file rename alerts in CrowdStrike; IR engaged
+```
+
+---
+
+## Investigation Walkthrough
+
+### Phase 1 — Triage & Acquisition (KAPE)
+
+Upon engagement, KAPE was deployed to the initial beachhead host `JUMP01` and primary domain controller `DC01` for rapid artefact collection.
+
+**KAPE command used:**
+
+```bash
+kape.exe --tsource C: --tdest D:\Cases\DFIR-2024-001\JUMP01 \
+  --target !SANS_Triage,EventLogs,ScheduledTasks,Prefetch,RecentFiles \
+  --module !EZParser
+```
+
+**Key artefacts targeted:**
+- Windows Event Logs (`Security`, `System`, `PowerShell/Operational`)
+- Scheduled Tasks (`C:\Windows\System32\Tasks\`)
+- Prefetch files (`C:\Windows\Prefetch\`)
+- MFT ($MFT) for timeline reconstruction
+- Registry hives (SYSTEM, SOFTWARE, NTUSER.DAT)
+
+**SHA-256 hashes of acquired images:**
+```
+JUMP01_C_Drive.E01   → a3f9d2...c847e1  [VERIFIED]
+DC01_C_Drive.E01     → 7bc401...f93d22  [VERIFIED]
+```
+
+---
+
+### Phase 2 — Log Analysis with Hayabusa
+
+Hayabusa was run against extracted Windows event logs to rapidly surface suspicious activity using Sigma-compatible detection rules.
+
+```bash
+hayabusa.exe csv-timeline \
+  --directory D:\Cases\DFIR-2024-001\JUMP01\EventLogs \
+  --output D:\Cases\DFIR-2024-001\hayabusa_timeline.csv \
+  --min-level medium \
+  --enable-noisy-rules
+```
+
+**Critical detections surfaced:**
+
+```
+[CRITICAL] 2024-03-14 09:47:11 UTC | Lsass Memory Dump via Task Manager
+           EventID: 10 | Source: JUMP01 | User: jmartin
+           Rule: win_lsass_dump_task_manager
+
+[HIGH]     2024-03-14 11:02:44 UTC | PsExec Lateral Movement Detected
+           EventID: 7045 | Source: FILESERV03
+           Rule: win_psexec_execution
+
+[HIGH]     2024-03-14 14:18:03 UTC | Rclone Data Exfiltration Tool
+           EventID: 4688 | Source: JUMP01 | CommandLine: rclone.exe copy
+           Rule: win_rclone_execution
+
+[CRITICAL] 2024-03-15 02:01:55 UTC | Scheduled Task Created — Suspicious Name
+           EventID: 4698 | TaskName: \Microsoft\Windows\WindowsUpdateSvc
+           Rule: win_susp_schtask_creation
+```
+
+---
+
+### Phase 3 — MFT & Prefetch Analysis (EZTools)
+
+#### MFT Timeline Reconstruction
+
+```bash
+MFTECmd.exe -f "D:\Cases\DFIR-2024-001\JUMP01\$MFT" \
+  --csv D:\Cases\DFIR-2024-001\mft_output\ \
+  --csvf JUMP01_MFT.csv
+```
+
+**Suspicious files identified in MFT:**
+
+| Filename | Path | Created (UTC) | Size |
+|----------|------|---------------|------|
+| `svchost_update.exe` | `C:\Windows\Temp\` | 2024-03-15 01:58:03 | 2.1 MB |
+| `rclone.exe` | `C:\ProgramData\Oracle\Java\` | 2024-03-14 13:44:11 | 58 MB |
+| `rclone.conf` | `C:\ProgramData\Oracle\Java\` | 2024-03-14 13:55:02 | 1.2 KB |
+| `psexec.exe` | `C:\Windows\Temp\` | 2024-03-14 11:00:44 | 809 KB |
+| `webshell.cgi` | `C:\Inetpub\dana-na\auth\` | 2024-03-12 10:22:17 | 4.1 KB |
+
+#### Prefetch Analysis
+
+```bash
+PECmd.exe -d "D:\Cases\DFIR-2024-001\JUMP01\Prefetch" \
+  --csv D:\Cases\DFIR-2024-001\prefetch_output\
+```
+
+**Prefetch confirms execution of:**
+```
+RCLONE.EXE-A3B7C291.pf       Last run: 2024-03-14 14:02:17 UTC  (Run count: 4)
+PSEXEC.EXE-D4E812F0.pf        Last run: 2024-03-14 11:05:33 UTC  (Run count: 11)
+SVCHOST_UPDATE.EXE-FF3A1100.pf Last run: 2024-03-15 02:01:58 UTC  (Run count: 1)
+```
+
+---
+
+### Phase 4 — CrowdStrike Falcon EDR Telemetry
+
+CrowdStrike Falcon provided real-time process tree telemetry, corroborating the forensic artefacts.
+
+**Process tree for ransomware execution:**
+
+```
+gpscript.exe (GPO execution)
+  └── cmd.exe /c \\DC01\SYSVOL\scripts\update.bat
+        └── svchost_update.exe --no-vm --sleep 60
+              ├── vssadmin.exe delete shadows /all /quiet   [T1490]
+              ├── wbadmin.exe delete catalog -quiet         [T1490]
+              ├── bcdedit.exe /set {default} recoveryenabled no
+              └── [File encryption begins across mapped drives]
+```
+
+**Falcon alert snippets:**
+
+```
+ALERT: Ransomware-like File Modification Activity
+Host: FILESERV03 | Severity: Critical
+Process: svchost_update.exe (PID 4821)
+Files modified in 60s: 14,332 (.bcrypt extension appended)
+
+ALERT: Volume Shadow Copy Deletion
+Host: FILESERV03
+CommandLine: vssadmin.exe delete shadows /all /quiet
+Parent: svchost_update.exe
+```
+
+---
+
+### Phase 5 — Rclone Config Analysis (Exfiltration)
+
+The recovered `rclone.conf` revealed the exfiltration destination:
+
+```ini
+[mega_backup]
+type = mega
+user = logistics_backup_2024@proton.me
+pass = <obfuscated_base64>
+```
+
+**Network forensics confirmed:**
+- 280 GB transferred to MEGA between `2024-03-14 13:55 – 14:22 UTC`
+- Destination IP: `31.216.148.14` (MEGA NZ infrastructure — Netherlands)
+- Exfil rate: ~175 Mbps sustained, suggesting pre-planned staging
+
+---
+
+## Indicators of Compromise (IOCs)
+
+### File Hashes (SHA-256)
+```
+svchost_update.exe  — e3b0c44298fc1c149afb4c8996fb92427ae41e4649b934ca495991b7852b855
+rclone.exe          — 2c624232cdd221771294dfbb310acbc7def46b3b0d6520b30b5d76a7a84d57d
+psexec.exe          — legitimate — flagged by path anomaly (C:\Windows\Temp\)
+webshell.cgi        — 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a8
+```
+
+### Network IOCs
+```
+185.220.101.47     — Initial exploit source (Tor exit node)
+31.216.148.14      — MEGA exfiltration endpoint
+94.102.49.190      — C2 beacon (Cobalt Strike — identified in memory)
+```
+
+### Registry Persistence
+```
+HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks\
+  → {A3F9D291-4B7C-4E21-BC3A-D7F921E40033}  [WindowsUpdateSvc]
+```
+
+---
+
+## Containment Actions Taken
+
+1. Isolated all encrypted hosts at the network switch level (VLAN quarantine)
+2. Disabled domain account `svc_backup2` and reset `jmartin` credentials
+3. Revoked all active VPN sessions and patched CVE-2023-46805
+4. Blocked IOC hashes in CrowdStrike Custom IOC policy
+5. Engaged MEGA legal team for exfiltration data preservation request
+6. Initiated AD forest recovery procedure from clean offline backup (D-7)
+
+---
+
+## Root Cause & Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| Ivanti VPN unpatched (CVE-2023-46805) | Implement mandatory patch SLA: Critical CVEs patched within 24 hours |
+| LSASS not protected | Enable Credential Guard; restrict Task Manager dump via ASR rule |
+| No MFA on VPN | Enforce phishing-resistant MFA (FIDO2) on all remote access |
+| Rclone not blocked | Implement application allowlisting (Windows Defender Application Control) |
+| VSS copies destroyed | Maintain immutable offline backups; test recovery quarterly |
+| Lateral movement undetected | Tune CrowdStrike for PsExec + admin share detections; segment VLANs |
+
+---
+
+## Lessons Learned
+
+- **Detection gap:** LSASS dump via Task Manager triggered a low-severity alert that was not actioned. A dedicated playbook for credential dumping detections — regardless of severity — would have shortened dwell time from 72 hours to under 4 hours.
+- **Exfiltration detection:** 280 GB leaving the network in 27 minutes should have triggered a DLP alert. Network egress baselining and anomaly alerting was absent.
+- **Immutable backups were the deciding factor:** Recovery was possible within 48 hours due to an offline, air-gapped backup taken 7 days prior. Without it, estimated recovery time was 3–4 weeks.
