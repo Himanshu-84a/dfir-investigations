@@ -1,10 +1,10 @@
 # Case 02 — Fileless Malware via Process Injection: Memory Forensics Investigation
 
-**Case ID:** DFIR-2024-002  
-**Classification:** High  
-**Investigator:** Himanshu Chourasia  
-**Tools:** Volatility 3, KAPE, Magnet AXIOM, CrowdStrike Falcon  
-**Duration:** 9 hours (triage → memory acquisition → analysis → containment)
+Case ID: DFIR-2024-002  
+Classification: High  
+Investigator: Himanshu Chourasia  
+Tools: Volatility 3, KAPE, Magnet AXIOM, CrowdStrike Falcon  
+Duration: 9 hours (triage → memory acquisition → analysis → containment)
 
 ---
 
@@ -73,7 +73,7 @@ SHA-256: d4e8f2...a91c33  [VERIFIED]
 python vol.py -f WS-FIN-047.mem windows.pslist
 ```
 
-**Output (truncated — suspicious entries highlighted):**
+Output (truncated — suspicious entries highlighted):
 
 ```
 PID   PPID  Name                 Start Time (UTC)
@@ -85,7 +85,7 @@ PID   PPID  Name                 Start Time (UTC)
 4904  4821  powershell.exe       2024-03-11 09:02:03   ← spawned by Excel [SUSPICIOUS]
 ```
 
-> **Note:** `spoolsv.exe` is expected — but its network activity and injected memory regions are not. Parent-child relationship confirmed by PPID analysis.
+> Note: `spoolsv.exe` is expected — but its network activity and injected memory regions are not. Parent-child relationship confirmed by PPID analysis.
 
 ---
 
@@ -101,7 +101,7 @@ EXCEL.EXE (4821)
         └── [process exited — no child persisted on disk]
 ```
 
-**PowerShell command line recovered from memory:**
+PowerShell command line recovered from memory:
 
 ```powershell
 powershell.exe -NoP -NonI -W Hidden -Enc
@@ -109,7 +109,7 @@ JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAEkATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtACgA
 [base64 truncated — decoded to reflective loader shellcode]
 ```
 
-**Decoded payload (partial):**
+Decoded payload (partial):
 ```
 XOR key: 0x4A
 Decoded: MZ header detected — PE file loaded reflectively into spoolsv.exe (PID 1492)
@@ -136,7 +136,7 @@ Disassembly:
 ...
 ```
 
-> **RWX (Read-Write-Execute) memory not backed by a file on disk** is a primary indicator of reflective DLL injection. A legitimate `spoolsv.exe` will never have executable private memory regions containing a PE header.
+> RWX (Read-Write-Execute) memory not backed by a file on disk is a primary indicator of reflective DLL injection. A legitimate `spoolsv.exe` will never have executable private memory regions containing a PE header.
 
 ---
 
@@ -158,7 +158,7 @@ Base        InLoad  InInit  InMem  MappedPath
 0x1d0000    False   False   True   [NO PATH — anonymous mapping]
 ```
 
-> **`InLoad: False, InMem: True`** confirms the DLL is loaded in memory but deliberately unlinked from the PEB loader list — a hallmark of Cobalt Strike's reflective loader.
+> `InLoad: False, InMem: True` confirms the DLL is loaded in memory but deliberately unlinked from the PEB loader list — a hallmark of Cobalt Strike's reflective loader.
 
 ---
 
@@ -187,7 +187,7 @@ The injected DLL was dumped from memory and analysed:
 python vol.py -f WS-FIN-047.mem windows.dumpfiles --pid 1492 --virtaddr 0x1d0000
 ```
 
-Extracted PE submitted to **1768.py (Cobalt Strike config parser)**:
+Extracted PE submitted to 1768.py (Cobalt Strike config parser):
 
 ```
 BeaconType:          HTTPS
@@ -200,7 +200,7 @@ Watermark:           0x5109BF6D   ← Cobalt Strike Team Server license ID
 Spawn_to x64:        %windir%\sysnative\dllhost.exe
 ```
 
-> The **watermark** (0x5109BF6D) was cross-referenced with public threat intel — associated with a cracked Cobalt Strike build used by multiple financially-motivated threat actors.
+> The watermark (0x5109BF6D) was cross-referenced with public threat intel — associated with a cracked Cobalt Strike build used by multiple financially-motivated threat actors.
 
 ---
 
@@ -305,6 +305,6 @@ Spawn-to: dllhost.exe
 
 ## Key Takeaways
 
-- **Fileless attacks leave almost no on-disk evidence.** Traditional AV and file-based scanning will miss this class of threat entirely. Memory forensics is non-negotiable for complete incident reconstruction.
-- **Volatility's `malfind` + `ldrmodules` combination** is highly effective at surfacing reflective injection — RWX private memory + unlinked DLL = near-certain injection.
-- **Cobalt Strike watermarks** are a valuable attribution and hunting pivot — the same watermark across multiple cases often indicates a shared infrastructure or threat actor.
+- Fileless attacks leave almost no on-disk evidence. Traditional AV and file-based scanning will miss this class of threat entirely. Memory forensics is non-negotiable for complete incident reconstruction.
+- Volatility's `malfind` + `ldrmodules` combination is highly effective at surfacing reflective injection — RWX private memory + unlinked DLL = near-certain injection.
+- Cobalt Strike watermarks are a valuable attribution and hunting pivot — the same watermark across multiple cases often indicates a shared infrastructure or threat actor.
