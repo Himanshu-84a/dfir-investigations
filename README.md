@@ -81,4 +81,4 @@ Impact                ████████████  TA0040
 
 ---
 
-> **Disclaimer:** All scenarios, hostnames, IP addresses, usernames, and company names used in these writeups are entirely fictional and created for educational and portfolio purposes only. No real case data, evidence, or sensitive information is disclosed.
+> **Disclaimer:** All scenarios, hostnames, IP addresses, usernames, and company names used in these writeups are for educational and portfolio purposes only. No real case data, evidence, or sensitive information is disclosed.
