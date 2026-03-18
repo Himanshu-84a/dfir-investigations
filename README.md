@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/26080002/README.md)
 # DFIR Investigation Case Files
 
 **Author:** Himanshu Chourasia — Senior DFIR Engineer  
