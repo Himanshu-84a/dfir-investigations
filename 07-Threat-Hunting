@@ -1,0 +1,319 @@
+# Case 07 — Proactive Threat Hunt: Uncovering a Dormant APT in a Manufacturing Network
+
+**Case ID:** DFIR-2024-007  
+**Classification:** Critical  
+**Investigator:** Himanshu Chourasia  
+**Tools:** CrowdStrike Falcon (Threat Graph, RTR, Custom IOA), Zeek, Hayabusa, KAPE  
+**Duration:** 3-day structured hunt → active incident → containment
+
+---
+
+## Executive Summary
+
+A proactive threat hunting engagement at a mid-sized automotive parts manufacturer uncovered a dormant APT implant that had been present in the environment for an estimated 47 days without triggering a single automated alert. The threat actor had established persistence using a WMI event subscription — a technique that leaves no registry Run keys, no scheduled tasks, and no files in common persistence locations. The implant was discovered entirely through hypothesis-driven hunting using CrowdStrike Falcon Threat Graph, corroborated by Zeek network logs and Hayabusa event log analysis.
+
+---
+
+## Hunt Hypothesis
+
+> *"If a threat actor has established persistent access in this environment, they are most likely using a living-off-the-land technique that avoids common persistence paths. WMI event subscriptions and COM hijacking are the most likely candidates given the target's Windows-heavy estate."*
+
+Hunting is not searching for known IOCs. It is testing hypotheses about attacker behaviour using telemetry.
+
+---
+
+## MITRE ATT&CK TTP Mapping
+
+| Tactic | Technique | ID | Evidence |
+|--------|-----------|-----|---------|
+| Persistence | WMI Event Subscription | T1546.003 | __EventFilter + __EventConsumer + __FilterToConsumerBinding |
+| Defense Evasion | Indicator Removal | T1070 | Security event log cleared on 3 hosts |
+| Defense Evasion | Masquerading | T1036.005 | Implant named `svchost.exe` in non-standard path |
+| Discovery | System Network Configuration Discovery | T1016 | `ipconfig /all`, `arp -a`, `route print` observed |
+| Discovery | Domain Trust Discovery | T1482 | `nltest /domain_trusts` executed |
+| Lateral Movement | Pass the Ticket | T1550.003 | Kerberos TGT harvested and reused |
+| C2 | Web Protocols — HTTPS | T1071.001 | Low-and-slow beacon every 4 hours |
+| Collection | Data from Local System | T1005 | CAD design files staged for exfiltration |
+
+---
+
+## Hunt Walkthrough
+
+### Phase 1 — CrowdStrike Falcon: WMI Persistence Hunt
+
+**Hunt Query — Falcon Event Search (FQL):**
+
+```sql
+-- Hunt for WMI EventConsumer creation
+event_simpleName=WmiActivityEvent
+| search CommandLine="*CommandLineEventConsumer*"
+  OR CommandLine="*ActiveScriptEventConsumer*"
+| stats count by ComputerName, UserName, CommandLine
+| sort -count
+```
+
+**Results — 3 hosts with anomalous WMI activity:**
+
+```
+ComputerName    UserName   CommandLine
+MFG-WS-031     SYSTEM     CommandLineEventConsumer — "svchost.exe -k netsvcs"
+MFG-WS-047     SYSTEM     CommandLineEventConsumer — "powershell -enc [base64]"
+MFG-SRV-003    SYSTEM     ActiveScriptEventConsumer — VBScript loader
+```
+
+**Drilling into MFG-WS-031 via CrowdStrike RTR:**
+
+```bash
+# Connect via Real Time Response
+> runscript -Raw "Get-WMIObject -Namespace root\subscription -Class __EventFilter"
+
+Name:        WindowsUpdateFilter
+Query:       SELECT * FROM __InstanceModificationEvent WITHIN 60
+             WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'
+             AND TargetInstance.SystemUpTime >= 300
+# ↑ Fires 5 minutes after every system boot — guaranteed persistence
+```
+
+```bash
+> runscript -Raw "Get-WMIObject -Namespace root\subscription -Class __EventConsumer"
+
+Name:         WindowsUpdateConsumer
+CommandLine:  C:\Windows\System32\svchost.exe -k netsvcs -p
+# ↑ Looks legitimate — but path check reveals it's NOT the real svchost
+```
+
+```bash
+> runscript -Raw "Get-FileHash 'C:\Windows\System32\svchost.exe'"
+Hash: legitimate_microsoft_hash
+
+> runscript -Raw "Get-WMIObject __FilterToConsumerBinding -Namespace root\subscription"
+# Reveals binding points to:
+# C:\Windows\Temp\svchost.exe  ← DIFFERENT PATH — malicious copy
+```
+
+> **The implant named itself `svchost.exe` and was placed in `C:\Windows\Temp\` — not `System32`. WMI subscription fires 5 minutes after every boot, executing the malicious binary. Zero registry keys. Zero scheduled tasks. Traditional persistence hunting would have missed this entirely.**
+
+---
+
+### Phase 2 — Falcon Threat Graph: Lateral Movement Reconstruction
+
+CrowdStrike Threat Graph visualised the full attack tree across all 3 affected hosts:
+
+```
+INITIAL HOST (MFG-WS-031)
+  └── svchost.exe [malicious] (PID 4821)
+        ├── cmd.exe → ipconfig /all
+        ├── cmd.exe → nltest /domain_trusts
+        ├── cmd.exe → klist  ← Kerberos ticket enumeration
+        └── cmd.exe → mimikatz.exe  ← credential harvesting
+              └── [Pass-the-Ticket to MFG-SRV-003]
+                    └── svchost.exe [malicious] deployed
+                          └── [Pass-the-Ticket to MFG-SRV-007]
+                                └── svchost.exe [malicious] deployed
+```
+
+**Falcon Custom IOA (Indicator of Attack) rule that would have caught this:**
+
+```yaml
+Rule Name:    WMI_Persistence_LowAndSlow
+Platform:     Windows
+Action:       Detect + Alert
+
+Conditions:
+  - event: WmiActivityEvent
+  - field: CommandLine
+  - operator: contains
+  - value: "EventConsumer"
+  AND
+  - field: ParentProcessName
+  - operator: not_in
+  - value: ["WmiPrvSE.exe", "svchost.exe"]  # only legit WMI parents
+```
+
+> This rule was deployed post-hunt. Had it been active, detection would have occurred on Day 1 of compromise.
+
+---
+
+### Phase 3 — Zeek: C2 Beacon Pattern Analysis
+
+Zeek `conn.log` revealed the low-and-slow C2 beacon:
+
+```zeek
+# Zeek conn.log entries for MFG-WS-031
+ts                  orig_h        resp_h           duration  orig_bytes  resp_bytes
+2024-04-01 02:14:01 10.10.8.31   94.102.49.190   0.341s    842         1204
+2024-04-01 06:14:03 10.10.8.31   94.102.49.190   0.338s    839         1198
+2024-04-01 10:14:01 10.10.8.31   94.102.49.190   0.342s    844         1201
+2024-04-01 14:14:02 10.10.8.31   94.102.49.190   0.340s    841         1203
+```
+
+**Zeek script to detect low-and-slow beaconing:**
+
+```zeek
+global beacon_tracker: table[addr] of vector of time;
+
+event connection_state_remove(c: connection)
+  {
+  local orig = c$id$orig_h;
+  local resp = c$id$resp_h;
+
+  if ( resp == 94.102.49.190 )  # or use threat intel feed
+    {
+    if ( orig !in beacon_tracker )
+      beacon_tracker[orig] = vector();
+
+    beacon_tracker[orig] += c$start_time;
+
+    if ( |beacon_tracker[orig]| >= 4 )
+      {
+      # Calculate jitter between connections
+      local intervals: vector of interval;
+      for ( i in beacon_tracker[orig] )
+        {
+        if ( i > 0 )
+          intervals += beacon_tracker[orig][i] - beacon_tracker[orig][i-1];
+        }
+      # Alert if interval variance < 5 seconds (suspiciously regular)
+      NOTICE([$note=C2::Beaconing_Detected,
+              $src=orig,
+              $msg="Low-and-slow beacon detected — 4hr interval ±2s jitter"]);
+      }
+    }
+  }
+```
+
+**Beacon characteristics confirmed:**
+```
+Interval:     14,400 seconds (exactly 4 hours)
+Jitter:       ±2 seconds
+Byte size:    840–845 bytes outbound (suspiciously consistent)
+Protocol:     HTTPS (443)
+Duration:     47 days of undetected beaconing
+```
+
+---
+
+### Phase 4 — Hayabusa: Event Log Validation
+
+Hayabusa was run across collected event logs to validate and expand findings:
+
+```bash
+hayabusa csv-timeline \
+  --directory D:\Cases\007\EventLogs \
+  --output hunt_timeline.csv \
+  --min-level medium
+```
+
+**Key detections:**
+
+```
+[CRITICAL] Security event log cleared — 3 hosts
+           EventID: 1102 | Hosts: MFG-WS-031, MFG-WS-047, MFG-SRV-003
+           Times: within 10 minutes of each other on 2024-03-29
+           → Coordinated log clearing — confirms human operator behind keyboard
+
+[HIGH]     Kerberos TGT Request — anomalous account
+           EventID: 4768 | Account: svc_mfg_automation
+           Source: MFG-WS-031 → used on MFG-SRV-003 (Pass-the-Ticket)
+
+[HIGH]     WMI Remote Execution
+           EventID: 4624 LogonType 3 + 4688 WmiPrvSE.exe child process
+           → Lateral movement confirmed via WMI remote execution
+```
+
+> **Coordinated log clearing across 3 hosts within 10 minutes** is one of the strongest indicators of a human operator actively managing the intrusion — not automated malware. This elevated the threat assessment to APT-level.
+
+---
+
+### Phase 5 — Scoping: Full Environment Hunt
+
+Following initial findings, the hunt was expanded across the full estate using Falcon:
+
+```sql
+-- Hunt for malicious svchost copies outside System32
+event_simpleName=ProcessRollup2
+| search FileName="svchost.exe"
+  AND NOT FilePath="C:\\Windows\\System32\\"
+  AND NOT FilePath="C:\\Windows\\SysWOW64\\"
+| stats count by ComputerName, FilePath, SHA256HashData
+```
+
+**Results:**
+```
+MFG-WS-031   C:\Windows\Temp\svchost.exe      SHA256: 7f83b1...
+MFG-WS-047   C:\Windows\Temp\svchost.exe      SHA256: 7f83b1...  (same hash)
+MFG-SRV-003  C:\ProgramData\Microsoft\svchost.exe  SHA256: 7f83b1...
+MFG-SRV-007  C:\Windows\Temp\svchost.exe      SHA256: 7f83b1...
+```
+
+4 compromised hosts. All running the same implant. All missed by automated detection for 47 days.
+
+---
+
+## Hunt Summary — What Automated Detection Missed
+
+| Detection Method | Found It? | Why |
+|-----------------|-----------|-----|
+| AV signature scan | ❌ | Implant signed with stolen cert |
+| EDR behavioural alert | ❌ | WMI subscription — no common persistence path |
+| SIEM rule — scheduled tasks | ❌ | No scheduled tasks used |
+| SIEM rule — registry Run keys | ❌ | No registry persistence used |
+| **Proactive threat hunt** | ✅ | Hypothesis-driven WMI query |
+
+---
+
+## Indicators of Compromise
+
+### File
+```
+svchost.exe (malicious)
+SHA256:  7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d906
+Paths:   C:\Windows\Temp\, C:\ProgramData\Microsoft\
+```
+
+### WMI Persistence
+```
+__EventFilter:     WindowsUpdateFilter
+__EventConsumer:   WindowsUpdateConsumer
+Namespace:         root\subscription
+Trigger:           System uptime >= 300 seconds (5 min post-boot)
+```
+
+### Network
+```
+94.102.49.190:443    — C2 beacon (HTTPS)
+Beacon interval:     14,400s (4 hours) ±2s jitter
+Byte signature:      840–845 bytes outbound per beacon
+```
+
+---
+
+## Containment Actions
+
+1. Removed WMI subscriptions from all 4 hosts via CrowdStrike RTR
+2. Deleted malicious `svchost.exe` copies from all affected paths
+3. Blocked `94.102.49.190` at perimeter firewall
+4. Invalidated `svc_mfg_automation` Kerberos tickets — forced re-authentication
+5. Deployed Falcon Custom IOA rule for WMI EventConsumer creation
+6. Deployed Zeek beacon detection script across all network segments
+
+---
+
+## Recommendations
+
+| Finding | Recommendation |
+|---------|---------------|
+| WMI persistence undetected for 47 days | Deploy dedicated WMI persistence hunting on weekly cadence |
+| Log clearing unalerted | Alert immediately on EventID 1102 across all hosts simultaneously |
+| No beacon detection | Implement Zeek beaconing detection — interval consistency scoring |
+| Kerberos ticket abuse | Enable Falcon Identity Protection — anomalous ticket usage alerting |
+| Hunt cadence absent | Formalise monthly proactive threat hunting programme |
+
+---
+
+## Key Takeaways
+
+- **Automated detection has blind spots.** WMI event subscriptions are one of the most effective persistence techniques precisely because most detection rules focus on registry keys and scheduled tasks. Hypothesis-driven hunting fills these gaps.
+- **Beaconing regularity is a gift to defenders.** A 4-hour interval with ±2 second jitter is machine-generated. Humans don't operate that consistently. Zeek interval analysis surfaces this pattern reliably.
+- **Coordinated log clearing is a human signal.** Automated malware rarely clears logs. When three hosts clear their Security event logs within 10 minutes of each other, a human operator is actively managing the intrusion — escalate immediately.
+- **CrowdStrike Threat Graph** is one of the most powerful lateral movement reconstruction tools available — the visual attack tree across hosts dramatically accelerates scope determination in complex intrusions.
